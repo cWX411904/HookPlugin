@@ -4,6 +4,8 @@ import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Message;
@@ -11,11 +13,14 @@ import android.os.Parcelable;
 import android.util.Log;
 import android.view.View;
 
+import java.io.File;
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.Map;
 
 import dalvik.system.DexClassLoader;
 import dalvik.system.PathClassLoader;
@@ -192,82 +197,175 @@ public class HookUtils {
     }
 
     /**
-     * 将插件的apk的dex文件转换为Element数组
+     * 观察源码会发现ActivityThread有个ArrayMap<String, WeakReference<LoadApk> mPackages
+     * 我们可以通过修改mPackages，将插件的包名和LoadApk作为键值对put到这个mPackages中
+     *
      */
-    public void injectPluginClass() {
-
-        //缓存路径
-        String cachePath = mContext.getCacheDir().getAbsolutePath();
-
-        //插件apk路径
-        String apkPath = Environment.getExternalStorageDirectory().getAbsolutePath() + "/plugin.apk";
-
-        DexClassLoader dexClassLoader = new DexClassLoader(apkPath, cachePath, cachePath, mContext.getClassLoader());
-
-        /**
-         * 接下来要实现三步
-         * 第一步：找到插件的Element数组，在DexPathList类的成员对象是dexElements；
-         * 第二步：找到宿主的Element数组，在DexPathList类的成员对象是dexElements；
-         * 第三步：把上面两个dexElement合并成新的dexElement，然后通过反射，注入到宿主的dexElement
-         */
-
+    public void putLoadApk(String path) {
+        //第一步：先反射找到mPackages这个Map对象
         try {
-            //第一步
-            Class<?> myDexClassLoader = Class.forName("dalvik.system.BaseDexClassLoader");
-            Field myPathListField = myDexClassLoader.getDeclaredField("pathList");
-            myPathListField.setAccessible(true);
-            Object myPathListObject = myPathListField.get(dexClassLoader);
+            //先还原ActivityThread对象
+            Class<?> activityThreadClass = Class.forName("android.app.ActivityThread");
+            Method currentActivityThreadMethod = activityThreadClass.getDeclaredMethod("currentActivityThread");
+            currentActivityThreadMethod.setAccessible(true);
+            Object currentActitityThread = currentActivityThreadMethod.invoke(null);
 
-            Class<?> myPathListClass = myPathListObject.getClass();
-            Field myElementsField = myPathListClass.getDeclaredField("dexElements");
-            myElementsField.setAccessible(true);
-            //自己插件的dexElements数组
-            Object myElements = myElementsField.get(myPathListObject);
+            //再来还原mPackages对象
+            Field mPackagesField = activityThreadClass.getDeclaredField("mPackages");
+            mPackagesField.setAccessible(true);
+            Map mPackages = (Map) mPackagesField.get(currentActitityThread);
 
+            //第二步：将插件的apk文件转换为LoadApk
+            //系统的源码是通过getPackageInfoNoCheck(ApplicationInfo, CompatibilityInfo);内部实际上还是调用了getPackageInfo
+            //那么我们反射哪个方法好些呢？
+            //getPackageInfoNoCheck 是public
+            //getPackageInfo 是private
+            //google开发工程师在编写源码时候，public方法不会修改，private是经常需要修改的，理解这个原则，那么我们反射public方法要好些
 
-            //第二步
-            PathClassLoader pathClassLoader = (PathClassLoader) mContext.getClassLoader();
-            Class<?> baseDexClassLoader = Class.forName("dalvik.system.BaseDexClassLoader");
-            Field pathListField = baseDexClassLoader.getDeclaredField("pathList");
-            pathListField.setAccessible(true);
-            Object pathListObject = pathListField.get(pathClassLoader);
+            //接下来开始反射getPackageInfoNoCheck方法
+            Class<?> compatibilityInfoClass = Class.forName("android.content.res.CompatibilityInfo");
+            Method getPackageInfoNoCheckMethod = activityThreadClass.getDeclaredMethod("getPackageInfoNoCheck", ApplicationInfo.class, compatibilityInfoClass);
 
-            Class<?> systemPathClass = pathListObject.getClass();
-            Field systemElementField = systemPathClass.getDeclaredField("dexElements");
-            systemElementField.setAccessible(true);
-            //宿主的dexElements数组
-            Object systemElements = systemElementField.get(pathListObject);
+            //再接下来，想办法得到ApplicationInfo的对象和CompatibilityInfo对象
+            Field defaultCompatibilityInfoField = compatibilityInfoClass.getDeclaredField("DEFAULT_COMPATIBILITY_INFO");
+            Object defaultCompatibilityInfo = defaultCompatibilityInfoField.get(null);
 
-            //第三步：融合新的dexElements
-            int systemlength = Array.getLength(systemElements);
+            //怎么去拿ApplicationInfo对象？在广播插件中已经实现过
+            ApplicationInfo applicationInfo = parseReceivers(mContext, path);
 
-            int myLength = Array.getLength(myElements);
+            Object loadedApk = getPackageInfoNoCheckMethod.invoke(currentActitityThread, applicationInfo, defaultCompatibilityInfo);
 
-            int newSystemLength = myLength + systemlength;
+            String odexPath = Utils.getPluginOptDexDir(applicationInfo.packageName).getPath();
+            String libDir = Utils.getPluginLibDir(applicationInfo.packageName).getPath();
 
-            Class<?> singleElementClass = systemElements.getClass().getComponentType();
-            Object newElementsArray = Array.newInstance(singleElementClass, newSystemLength);
+            //最终目的是替换ClassLoader
+            ClassLoader classLoader = new CustomClassLoader(path, odexPath, libDir, mContext.getClassLoader());
+            Field mClassLoaderField = loadedApk.getClass().getDeclaredField("mClassLoader");
+            mClassLoaderField.setAccessible(true);
+            mClassLoaderField.set(loadedApk, classLoader);
 
-            //融合
-            for (int i = 0; i < newSystemLength; i++) {
-                //先融合插件的Elements
-                if (i < myLength) {
-                    Array.set(newElementsArray, i, Array.get(myElements, i));
-                } else {
-                    Array.set(newElementsArray, i, Array.get(systemElements, i - myLength));
-                }
-            }
-            Field elementsField = pathListObject.getClass().getDeclaredField("dexElements");
-            elementsField.setAccessible(true);
-            //将新生成的Elements数组对象重新放到系统中去
-            elementsField.set(pathListObject, newElementsArray);
+            mPackages.put(applicationInfo.packageName, new WeakReference<>(loadedApk));
 
         } catch (Exception e) {
             e.printStackTrace();
         }
-
-
     }
+
+    private ApplicationInfo parseReceivers(Context context, String path) {
+        try {
+            Class<?> packageParserClass = Class.forName("android.content.pm.PackageParser");
+            Method parsePackageMethod = packageParserClass.getDeclaredMethod("parsePackage", File.class, int.class);
+            Object packageParser = packageParserClass.newInstance();
+            Object packageObj = parsePackageMethod.invoke(packageParser, new File(path), PackageManager.GET_ACTIVITIES);
+
+            Class<?> componentClass = Class.forName("android.content.pm.PackageParser$Component");
+            Field intentsField = componentClass.getDeclaredField("intents");
+            Class<?> packageParser$ActivityClass = Class.forName("android.content.pm.PackageParser$Activity");
+            Class<?> packageUserStateClass = Class.forName("android.content.pm.PackageUserState");
+            Object defaultUserState = packageUserStateClass.newInstance();
+            Method generateReceiverInfo = packageParserClass.getDeclaredMethod("generateActivityInfo",
+                    packageParser$ActivityClass, int.class, packageUserStateClass, int.class);
+            Class<?> userHandler = Class.forName("android.os.UserHandle");
+            Method getCallingUserIdMethod = userHandler.getDeclaredMethod("getCallingUserId");
+            int userId = (int) getCallingUserIdMethod.invoke(null);
+            Method generateApplicationInfoMethod = packageParserClass.getDeclaredMethod("generateApplicationInfo",
+                    packageObj.getClass(),
+                    int.class,
+                    packageUserStateClass);
+            ApplicationInfo applicationInfo = (ApplicationInfo) generateApplicationInfoMethod.invoke(packageParser,
+                    packageObj, 0, defaultUserState);
+
+            applicationInfo.sourceDir = path;
+            applicationInfo.publicSourceDir = path;
+            return applicationInfo;
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    /**
+     * 将插件的apk的dex与宿主的dex融合
+     *
+     * 这个方法会带来两个问题：
+     * 1.加载多个插件会导致dexElement过大，内存爆棚；
+     * 2.如果插件崩溃，那么宿主也跟着崩溃，耦合性太高。
+     *
+     */
+//    public void injectPluginClass() {
+//
+//        //缓存路径
+//        String cachePath = mContext.getCacheDir().getAbsolutePath();
+//
+//        //插件apk路径
+//        String apkPath = Environment.getExternalStorageDirectory().getAbsolutePath() + "/plugin.apk";
+//
+//        DexClassLoader dexClassLoader = new DexClassLoader(apkPath, cachePath, cachePath, mContext.getClassLoader());
+//
+//        /**
+//         * 接下来要实现三步
+//         * 第一步：找到插件的Element数组，在DexPathList类的成员对象是dexElements；
+//         * 第二步：找到宿主的Element数组，在DexPathList类的成员对象是dexElements；
+//         * 第三步：把上面两个dexElement合并成新的dexElement，然后通过反射，注入到宿主的dexElement
+//         */
+//
+//        try {
+//            //第一步
+//            Class<?> myDexClassLoader = Class.forName("dalvik.system.BaseDexClassLoader");
+//            Field myPathListField = myDexClassLoader.getDeclaredField("pathList");
+//            myPathListField.setAccessible(true);
+//            Object myPathListObject = myPathListField.get(dexClassLoader);
+//
+//            Class<?> myPathListClass = myPathListObject.getClass();
+//            Field myElementsField = myPathListClass.getDeclaredField("dexElements");
+//            myElementsField.setAccessible(true);
+//            //自己插件的dexElements数组
+//            Object myElements = myElementsField.get(myPathListObject);
+//
+//
+//            //第二步
+//            PathClassLoader pathClassLoader = (PathClassLoader) mContext.getClassLoader();
+//            Class<?> baseDexClassLoader = Class.forName("dalvik.system.BaseDexClassLoader");
+//            Field pathListField = baseDexClassLoader.getDeclaredField("pathList");
+//            pathListField.setAccessible(true);
+//            Object pathListObject = pathListField.get(pathClassLoader);
+//
+//            Class<?> systemPathClass = pathListObject.getClass();
+//            Field systemElementField = systemPathClass.getDeclaredField("dexElements");
+//            systemElementField.setAccessible(true);
+//            //宿主的dexElements数组
+//            Object systemElements = systemElementField.get(pathListObject);
+//
+//            //第三步：融合新的dexElements
+//            int systemlength = Array.getLength(systemElements);
+//
+//            int myLength = Array.getLength(myElements);
+//
+//            int newSystemLength = myLength + systemlength;
+//
+//            Class<?> singleElementClass = systemElements.getClass().getComponentType();
+//            Object newElementsArray = Array.newInstance(singleElementClass, newSystemLength);
+//
+//            //融合
+//            for (int i = 0; i < newSystemLength; i++) {
+//                //先融合插件的Elements
+//                if (i < myLength) {
+//                    Array.set(newElementsArray, i, Array.get(myElements, i));
+//                } else {
+//                    Array.set(newElementsArray, i, Array.get(systemElements, i - myLength));
+//                }
+//            }
+//            Field elementsField = pathListObject.getClass().getDeclaredField("dexElements");
+//            elementsField.setAccessible(true);
+//            //将新生成的Elements数组对象重新放到系统中去
+//            elementsField.set(pathListObject, newElementsArray);
+//
+//        } catch (Exception e) {
+//            e.printStackTrace();
+//        }
+//
+//
+//    }
 }
 
 

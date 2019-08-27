@@ -1,6 +1,7 @@
 package com.ck.hooklogin;
 
 import android.app.Application;
+import android.content.Context;
 import android.content.res.AssetManager;
 import android.content.res.Resources;
 import android.os.Environment;
@@ -9,15 +10,21 @@ import java.lang.reflect.Method;
 
 public class MyApplication extends Application {
 
+    private static Context  instance;
     private AssetManager assetManager;
     private Resources newResource;
+
+    public static Context getInstance() {
+        return instance;
+    }
 
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;
         HookUtils hookUtils = new HookUtils();
         hookUtils.hookStartActivity(this);
-        hookUtils.injectPluginClass();
+//        hookUtils.injectPluginClass();
 
         String apkPath = Environment.getExternalStorageDirectory().getAbsolutePath() + "/plugin.apk";
 
