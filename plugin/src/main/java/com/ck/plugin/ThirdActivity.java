@@ -1,17 +1,17 @@
-package com.ck.hooklogin;
+package com.ck.plugin;
 
 import android.app.Activity;
 import android.os.Bundle;
 import android.support.annotation.Nullable;
 
 /**
- * Created by 48608 on 2018/1/12.
+ * Created by Administrator on 2018/2/26 0026.
  */
 
-public class SceondActivity extends Activity {
+public class ThirdActivity extends BaseActivity {
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_second);
+        setContentView(R.layout.activity_thrid);
     }
 }
